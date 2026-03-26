@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jedi Relay Station</title>
+    <style>
+        /*
+         * Star Wars terminal aesthetic:
+         * Dark background, amber text, monospace font.
+         * Minimal CSS -- this isn't a frontend course.
+         */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #0a0a0a;
+            color: #ffb347;
+            font-family: "Courier New", Courier, monospace;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+
+        h1 {
+            color: #ffd700;
+            margin-bottom: 0.5rem;
+            font-size: 1.4rem;
+        }
+
+        .subtitle {
+            color: #888;
+            margin-bottom: 2rem;
+            font-size: 0.85rem;
+        }
+
+        #chat-container {
+            width: 100%;
+            max-width: 700px;
+            flex: 1;
+        }
+
+        #output {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 1rem;
+            min-height: 300px;
+            max-height: 500px;
+            overflow-y: auto;
+            margin-bottom: 1rem;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            line-height: 1.6;
+            font-size: 0.9rem;
+        }
+
+        .user-msg {
+            color: #5dade2;
+            margin-bottom: 0.5rem;
+        }
+
+        .assistant-msg {
+            color: #ffb347;
+            margin-bottom: 1rem;
+        }
+
+        .status-msg {
+            color: #7dcea0;
+            font-style: italic;
+            margin-bottom: 0.5rem;
+        }
+
+        .error-msg {
+            color: #e74c3c;
+        }
+
+        #input-row {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        #message-input {
+            flex: 1;
+            padding: 0.7rem;
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #ffb347;
+            font-family: inherit;
+            font-size: 0.9rem;
+        }
+
+        #message-input:focus {
+            outline: none;
+            border-color: #ffd700;
+        }
+
+        #send-btn {
+            padding: 0.7rem 1.5rem;
+            background: #333;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: #ffd700;
+            font-family: inherit;
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+
+        #send-btn:hover { background: #444; }
+        #send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <h1>// JEDI RELAY STATION //</h1>
+    <p class="subtitle">Streaming LLM responses via Server-Sent Events</p>
+
+    <div id="chat-container">
+        <div id="output"></div>
+        <div id="input-row">
+            <input
+                type="text"
+                id="message-input"
+                placeholder="Ask the Jedi Master a question..."
+                autofocus
+            />
+            <button id="send-btn">TRANSMIT</button>
+        </div>
+    </div>
+
+    <!--
+    ============================================================
+      BROWSER-SIDE STREAM CONSUMPTION
+    ============================================================
+
+      Why not EventSource?
+      EventSource only supports GET requests. Our endpoint is POST
+      (because we need to send a JSON body with the user message).
+      So we use fetch() + ReadableStream instead.
+
+      Flow:
+        1. fetch() returns a Response with a readable body stream
+        2. We get a reader from response.body.getReader()
+        3. We read chunks (Uint8Array), decode them to text
+        4. We parse SSE lines ("data: {...}") from the text
+        5. We extract content tokens and append them to the page
+
+      The tricky part: chunks from the network don't align with
+      SSE event boundaries. A single chunk might contain multiple
+      events, or an event might span two chunks. We handle this
+      with a buffer that accumulates text until we find complete
+      SSE lines (ending with \n\n).
+    ============================================================
+    -->
+    <script>
+        const output = document.getElementById("output");
+        const input = document.getElementById("message-input");
+        const sendBtn = document.getElementById("send-btn");
+
+        // Determine the endpoint based on the current page.
+        // Mission 2 runs on /chat/stream, Mission 3 on /chat/stream too.
+        const STREAM_URL = "/chat/stream";
+
+        function appendMessage(text, className) {
+            const div = document.createElement("div");
+            div.className = className;
+            div.textContent = text;
+            output.appendChild(div);
+            output.scrollTop = output.scrollHeight;
+            return div;
+        }
+
+        async function sendMessage() {
+            const message = input.value.trim();
+            if (!message) return;
+
+            // Show user message
+            appendMessage("> " + message, "user-msg");
+            input.value = "";
+            sendBtn.disabled = true;
+
+            // Create a container for the assistant's streaming response
+            const assistantDiv = document.createElement("div");
+            assistantDiv.className = "assistant-msg";
+            output.appendChild(assistantDiv);
+
+            try {
+                // --------------------------------------------------
+                // fetch() with streaming body consumption
+                // --------------------------------------------------
+                // We can't use response.json() because that waits for
+                // the full body. Instead, we read the body as a stream.
+                const response = await fetch(STREAM_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ message: message }),
+                });
+
+                if (!response.ok) {
+                    appendMessage("Error: " + response.statusText, "error-msg");
+                    return;
+                }
+
+                // Get a reader for the response body stream
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    // Decode the chunk (Uint8Array -> string)
+                    buffer += decoder.decode(value, { stream: true });
+
+                    // ------------------------------------------
+                    // Parse SSE events from the buffer
+                    // ------------------------------------------
+                    // SSE events are separated by double newlines.
+                    // We split on \n\n and process complete events.
+                    // The last element might be incomplete, so we
+                    // keep it in the buffer for the next iteration.
+                    const events = buffer.split("\n\n");
+                    buffer = events.pop(); // Keep incomplete event
+
+                    for (const event of events) {
+                        const lines = event.trim().split("\n");
+                        for (const line of lines) {
+                            if (!line.startsWith("data: ")) continue;
+
+                            const data = line.slice(6); // Remove "data: "
+
+                            if (data === "[DONE]") {
+                                // Stream complete
+                                break;
+                            }
+
+                            try {
+                                const parsed = JSON.parse(data);
+
+                                // Content tokens (text streaming)
+                                if (parsed.content) {
+                                    assistantDiv.textContent += parsed.content;
+                                    output.scrollTop = output.scrollHeight;
+                                }
+
+                                // Status events (from Mission 3 tool calls)
+                                if (parsed.status) {
+                                    appendMessage(parsed.status, "status-msg");
+                                }
+                            } catch (e) {
+                                // Malformed JSON -- skip
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                appendMessage("Connection error: " + err.message, "error-msg");
+            } finally {
+                sendBtn.disabled = false;
+                input.focus();
+            }
+        }
+
+        // Send on button click or Enter key
+        sendBtn.addEventListener("click", sendMessage);
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") sendMessage();
+        });
+    </script>
+</body>
+</html>
